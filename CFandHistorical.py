@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import scipy.stats as stats
+from scipy.stats import norm
 import matplotlib.pyplot as plt
+
 
 def get_data(tickers, start, end):
     full = pd.DataFrame()
@@ -14,86 +15,122 @@ def get_data(tickers, start, end):
     log_returns = log_returns.dropna()
     weights = [0.4, 0.3, 0.2, 0.1]
     historical_returns = (log_returns * weights).sum(axis=1)
-    hh = historical_returns.to_frame("Log_Return")
-    return hh
+    return historical_returns.to_frame("Log_Return")
 
-# Fetch data once to avoid redundant downloads
-spy_data = get_data(['AAPL', 'SPY', 'XOM', 'MSFT'], start="2010-01-01", end="2024-12-01")
+def calculate_rolling_returns(data, window):
+    range_returns = data.rolling(window=window).sum()
+    range_returns = range_returns.dropna()
+    range_returns.rename(columns={"Log_Return": "RollingReturn"}, inplace=True)
+    return range_returns
 
-def process_data(lambd, window, confidence_level, n_days, spy_data):
-    # EWMA Volatility calculation
-    log_returns = spy_data['Log_Return'].values
-    ewma_volatility = []
-    for i in range(len(log_returns)):
-        if i < window:
-            ewma_volatility.append(np.nan)
-        else:
-            returns_window = log_returns[i-window:i]
-            weights = np.array([lambd ** (window - j - 1) for j in range(window)])
-            weights /= weights.sum()
-            volatility = np.sqrt(np.sum(weights * returns_window ** 2))
-            ewma_volatility.append(volatility)
-    spy_data[f'EWMA_Volatility_{n_days}_{confidence_level}'] = ewma_volatility
+def backtest_cornish_fischer(range_df, training_window, confidence):
+    z = norm.ppf(1 - confidence)
+    def cornish_fischer_adjustment(series):
+        mean = series.mean()
+        std = series.std()
+        skewness = series.skew()
+        kurtosis = series.kurt() - 3  # Excess kurtosis
+        cf_var = mean + std * (
+            z 
+            + ((z ** 2 - 1) * skewness) / 6 
+            + ((z ** 3 - 3 * z) * kurtosis) / 24
+            + (2 * z ** 3 - 5 * z) * (kurtosis ** 2) / 36
+        )
+        return cf_var
+    
+    range_df['HistoricalVaR'] = (
+        range_df['RollingReturn']
+        .shift(1)
+        .rolling(window=training_window)
+        .quantile(1 - confidence)
+    )
+    range_df['CornishFischerVaR'] = (
+        range_df['RollingReturn']
+        .shift(1)
+        .rolling(window=training_window)
+        .apply(cornish_fischer_adjustment, raw=False)
+    )
+    return range_df.dropna()
 
-    # Calculate n-day VaR
-    critical_value = stats.norm.ppf(1 - confidence_level)
-    spy_data[f'{n_days}d_VaR_{confidence_level}'] = critical_value * spy_data[f'EWMA_Volatility_{n_days}_{confidence_level}'] * np.sqrt(n_days)
+# Parameters
+tickers = ['AAPL', 'SPY', 'XOM', 'MSFT']
+start_date = "2010-01-01"
+end_date = "2024-12-01"
+confidence_levels = [0.90, 0.95, 0.97, 0.99, 0.995]
+windows = [1, 5, 10, 30, 50]
+training_window = 1000
 
-    # Calculate summed returns for backtesting
-    spy_data[f'{n_days}d_Summed_Return'] = spy_data['Log_Return'].rolling(window=n_days).sum().shift(-n_days + 1)
+# Download data
+data = get_data(tickers, start=start_date, end=end_date)
 
-    # Calculate diff column and exceptions
-    spy_data[f'diff_{n_days}_{confidence_level}'] = (spy_data[f'{n_days}d_Summed_Return'] <= spy_data[f'{n_days}d_VaR_{confidence_level}']).astype(int)
+# Store results
+results = {}
+for confidence in confidence_levels:
+    for window in windows:
+        rolling_data = calculate_rolling_returns(data, window)
+        results[(confidence, window)] = backtest_cornish_fischer(rolling_data, training_window, confidence)
 
-    # Calculate accuracy metrics
-    valid_data = spy_data.dropna(subset=[f'{n_days}d_VaR_{confidence_level}', f'{n_days}d_Summed_Return'])
-    total_observations = len(valid_data)
-    expected_exceptions = (1 - confidence_level) * total_observations
-    actual_exceptions = valid_data[f'diff_{n_days}_{confidence_level}'].sum()
-    if total_observations > 0:
-        error = abs((1 - confidence_level) - (actual_exceptions / total_observations))
-    else:
-        error = np.nan  # Avoid division by zero
-    return {
-        'error': error,
-        'actual_exceptions': actual_exceptions,
-        'expected_exceptions': expected_exceptions,
-        'total_observations': total_observations
-    }
+# Prepare Cornish-Fischer and Historical Error Tables
+cornish_fischer_errors = np.zeros((len(windows), len(confidence_levels)))
+historical_errors = np.zeros((len(windows), len(confidence_levels)))
 
-if __name__ == "__main__":
-    n_days_list = [1, 5, 10, 30, 50]
-    confidence_levels = [0.90,0.95,0.97, 0.99, 0.995]
-    lambd = 0.93
-    window = 30
+for i, window in enumerate(windows):
+    for j, confidence in enumerate(confidence_levels):
+        result_df = results[(confidence, window)]
+        total_values = len(result_df)
+        cf_exceptions = (result_df['RollingReturn'] < result_df['CornishFischerVaR']).sum()
+        hist_exceptions = (result_df['RollingReturn'] < result_df['HistoricalVaR']).sum()
 
-    # Initialize a DataFrame to store errors
-    errors_table = pd.DataFrame(index=n_days_list, columns=confidence_levels)
+        # Calculate accuracy using the given formula
+        cf_accuracy = abs((1 - confidence) - (cf_exceptions / total_values)) * 100  # Format as percent
+        hist_accuracy = abs((1 - confidence) - (hist_exceptions / total_values)) * 100  # Format as percent
 
-    for n_days in n_days_list:
-        for confidence_level in confidence_levels:
-            result = process_data(lambd, window, confidence_level, n_days, spy_data.copy())
-            error = result['error']
-            errors_table.loc[n_days, confidence_level] = error
+        # Store the accuracy values in respective tables
+        cornish_fischer_errors[i, j] = cf_accuracy
+        historical_errors[i, j] = hist_accuracy
+        
 
-    # Convert errors to percentage format
-    errors_table = errors_table.applymap(lambda x: f"{x:.2%}" if pd.notnull(x) else x)
+# Round to two decimal places and add a % sign
+formatted_cornish_fischer_errors = [[f"{round(value, 2)}%" for value in row] for row in cornish_fischer_errors]
+formatted_historical_errors = [[f"{round(value, 2)}%" for value in row] for row in historical_errors]
 
-    print("Errors of VaR Estimates:")
-    print(errors_table)
+# Create Cornish-Fischer Error Table
+fig1, ax1 = plt.subplots(figsize=(8, 6))
+ax1.axis('tight')
+ax1.axis('off')
 
-    # Export the table as an image
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.axis('tight')
-    ax.axis('off')
-    table = ax.table(cellText=errors_table.values,
-                     rowLabels=errors_table.index,
-                     colLabels=errors_table.columns,
-                     cellLoc='center',
-                     loc='center')
-    table.auto_set_font_size(False)
-    table.set_fontsize(12)
-    table.scale(1, 2)  # Adjust as needed
-    plt.title('EWMA Errors (5x5 Table)', fontsize=16)
-    plt.savefig('errors_table.png', bbox_inches='tight')
-    plt.show()
+cf_table = ax1.table(
+    cellText=formatted_cornish_fischer_errors,
+    rowLabels=windows,
+    colLabels=confidence_levels,
+    loc='center',
+    cellLoc='center'
+)
+cf_table.auto_set_font_size(False)
+cf_table.set_fontsize(10)
+cf_table.scale(1.2, 1.2)
+
+plt.title("Cornish-Fischer Errors (5x5 Table)", pad=20)
+plt.savefig("cornish_fischer_table_5x5.png", bbox_inches="tight")
+plt.close()
+
+# Create Historical Error Table
+fig2, ax2 = plt.subplots(figsize=(8, 6))
+ax2.axis('tight')
+ax2.axis('off')
+
+hist_table = ax2.table(
+    cellText=formatted_historical_errors,
+    rowLabels=windows,
+    colLabels=confidence_levels,
+    loc='center',
+    cellLoc='center'
+)
+hist_table.auto_set_font_size(False)
+hist_table.set_fontsize(10)
+hist_table.scale(1.2, 1.2)
+
+plt.title("Historical Errors (5x5 Table)", pad=20)
+plt.savefig("historical_error_table_5x5.png", bbox_inches="tight")
+plt.close()
+
